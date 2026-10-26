@@ -1,88 +1,72 @@
-# openssl-shim
+# openssl-static
 
-Blocking HTTPS GET through the OpenSSL C API, for Crystal apps that make
-network calls from **raw threads without a Crystal scheduler** — e.g.
-Android egui/sokol apps, where every Crystal socket call from a worker
-thread dies with `NilAssertionError "Thread#scheduler cannot be nil"`.
+Seamless **stdlib networking from raw threads**: the real stdlib
+`HTTP::Client`, `TCPSocket` and `OpenSSL::SSL::Socket::Client` work as-is
+from pthreads that Crystal never started — e.g. the egui/sokol frame loop
+and its worker threads in Android apps. On such threads
+`Fiber::ExecutionContext.current` is nil, so every stdlib IO call dies
+(`NilAssertionError "Thread#scheduler cannot be nil"`, or a segfault in
+the Boehm GC when stdlib tries to auto-create the missing `::Thread`).
 
-One call does the whole exchange: DNS (`getaddrinfo`) → TCP connect →
-TLS handshake → GET → read-to-EOF. All syscalls are blocking
-(`SO_RCVTIMEO`/`SO_SNDTIMEO` timeouts); no event loop, no scheduler.
-Chunked response bodies are decoded in place by the shim.
+The shard patches the failure points and nothing else:
+
+* **`Crystal::EventLoop.current`** — when the running thread has no
+  execution context, returns a stateless blocking implementation of the
+  same abstract interface (`poll`/`recv`/`send`/`connect` over libc):
+  the thread simply blocks, no fibers involved. Scheduler-equipped
+  threads keep their io_uring/epoll loop untouched. `Fiber.syscall`
+  (DNS `getaddrinfo` offload) likewise runs inline on raw threads.
+* **`Crystal::System::Thread.current_thread`** — hands a raw thread a
+  stand-in `::Thread` (pre-created at require time) instead of lazily
+  running `::Thread.new`, which dies in `GC_get_my_stackbottom` on a
+  thread the GC never registered (`Fiber.current` reaches it from
+  everywhere, e.g. `Crystal::FdLock` on every socket close). The main
+  thread keeps the stdlib lazy create-and-store behavior.
+* **`GC.malloc` / `GC.malloc_atomic` / `GC.realloc`** — a raw thread
+  that triggers a Boehm collection aborts the process with
+  "Collecting from unknown thread"; the hooks register the running
+  pthread (`GC_register_my_thread`, true stack bounds via
+  `pthread_getattr_np`) at its first allocation. Per-thread cost is one
+  zero-initialized TLS flag read.
+
+The result — no shim API to learn:
 
 ```crystal
-require "openssl-shim"
+require "openssl-static"
 
-body = Openssl::HTTPS.get("api.example.com", "/v1/thing",
-                          ca_file: "/etc/ssl/certs/ca-certificates.crt")
+# from any thread, raw or scheduled:
+body = HTTP::Client.get("https://example.com")
+
+ctx = OpenSSL::SSL::Context::Client.new
+ctx.ca_certificates = "/etc/ssl/certs/ca-certificates.crt"
+HTTP::Client.new("api.example.com", tls: ctx) do |client|
+  client.post("/v1/thing", form: {"q" => "hi"})
+end
 ```
 
-The namespace is `Openssl` (not `OpenSSL`) so it never collides with the
-Crystal stdlib OpenSSL module. The shard is named `openssl-shim` (not
-`openssl`) because a shard named exactly `openssl` shadows the stdlib
-for every transitive bare `require "openssl"` — e.g. stdlib's own
-`http/client.cr` — and breaks `HTTP::Client` TLS for the whole app.
+## Linking
 
-## API
+The shard uses the stdlib OpenSSL bindings — there is no C shim to
+compile anymore (the old `OpenSSL::HTTPS` micro-client is gone).
+Consumers must link **libssl/libcrypto**:
 
-```crystal
-Openssl::HTTPS.get(host : String, path : String, port : Int32 = 443,
-                   ca_file : String? = nil, ca_dir : String? = nil,
-                   timeout_s : Int32 = 15) : String
-```
-
-Returns the response body; raises `Openssl::Error` on any failure:
-
-* shim errors keep their informative prefixes — `dns:`,
-  `tls_handshake:`, `ca_file:`, `read:`, `write:` …;
-* non-2xx answers raise `HTTP <code>: <status line>`.
-
-Verification is enabled when `ca_file` (a PEM bundle) or `ca_dir` (an
-OpenSSL hashed-CA dir) is given; the hostname is checked via
-`SSL_set1_host`. Both empty disables verification — the fallback for
-networks where DPI substitutes the certificate chain (callers can retry
-without CA on certificate errors).
-
-## Native code loading
-
-The primary target is **static linking into mobile apps (Android/iOS)**:
-there is no dlopen there — the shim C file is compiled into the app
-binary together with the Crystal code, and the Crystal side binds the
-extern symbols directly (same link unit). On desktop, static linking
-works exactly the same way if you prefer it; the default there is the
-dlopen mode below, which keeps the consumer free of any link-time
-dependency.
-
-* **Desktop (default)** — `ext/libhttps_shim.so` is `dlopen`'d at
-  runtime; the shard compiles it on first use if missing (path
-  dependencies don't run postinstall). No link-time dependency on
-  libssl, no `--link-flags` needed. Override the path with
-  `OPENSSL_SHIM_SO`.
-* **Android/iOS (or desktop with static linking)** — compile
-  `ext/https_shim.c` with your cross toolchain against a static OpenSSL
-  build and link it into the app binary (same link unit as the Crystal
-  code), e.g. for Android:
+* **Desktop** — the system shared libraries, nothing to configure.
+* **Android/iOS** — a static OpenSSL build linked into the app binary
+  together with the Crystal code, e.g. for Android:
 
   ```sh
-  "$NDK_CC" --target=aarch64-linux-android33 -O2 -fPIC \
-    -I"$OPENSSL_ANDROID/include" \
-    -c ext/https_shim.c -o build/https_shim_android.o
-  # link: ... build/https_shim_android.o -L"$OPENSSL_ANDROID" -lssl -lcrypto
+  # link: ... -L"$OPENSSL_ANDROID/lib" -lssl -lcrypto
   ```
 
-  With the `android` compile flag the Crystal side binds the extern
-  symbols directly (no dlopen); on desktop static linking works the
-  same way via the dlopen path resolution — or just link the object in
-  and set `OPENSSL_SHIM_SO` accordingly.
+That static-mobile, seamless-desktop combination is what the shard name
+says.
 
 ## Tests
 
 ```sh
-crystal spec    # локальный TLS-оракул: python3 http.server + ssl на 127.0.0.1
-rake test:net   # реальный интернет (MyMemory) — опциональная дежурная проверка
+crystal spec    # local TLS oracle: python3 https server on 127.0.0.1
 ```
 
-The oracle specs generate a self-signed certificate on the fly (SAN
-`IP:127.0.0.1`) and exercise the real TLS handshake: verification
-success/failure, verify-off fallback, chunked decoding, non-2xx,
-~1 MB bodies, DNS errors, oversized request paths, and read timeouts.
+The raw-thread spec runs a real `HTTP::Client` + TLS handshake (verified
+against a self-signed SAN IP:127.0.0.1 cert) on a genuine
+`pthread_create` thread, plus failure cases with a wrong CA.

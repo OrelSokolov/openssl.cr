@@ -9,7 +9,9 @@ at_exit { Oracle.stop }
 require "spec"
 require "process"
 require "socket"
-require "../src/openssl-shim"
+require "openssl"
+require "http/client"
+require "../src/openssl-static"
 
 module Oracle
   MARKER = "hello-oracle-body"
@@ -48,10 +50,16 @@ module Oracle
     @@server.try &.wait
   end
 
-  # GET через шард против оракула (по умолчанию — с верификацией).
+  # GET через stdlib HTTP::Client + OpenSSL против оракула (с верификацией
+  # по сертификату оракула) — тот же путь, что и из raw-треда.
   def self.get(path : String, timeout_s : Int32 = 15) : String
-    Openssl::HTTPS.get("127.0.0.1", path, port: port,
-                       ca_file: cert, timeout_s: timeout_s)
+    ctx = OpenSSL::SSL::Context::Client.new
+    ctx.ca_certificates = cert
+    client = HTTP::Client.new("127.0.0.1", port, ctx)
+    client.read_timeout = timeout_s.seconds
+    response = client.get(path)
+    raise "HTTP #{response.status_code}" unless response.status.success?
+    response.body
   end
 
   private def self.gen_cert(cert : String, key : String) : Nil
