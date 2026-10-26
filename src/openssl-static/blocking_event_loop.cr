@@ -28,9 +28,13 @@ lib LibOS
 end
 
 module OpenSSLStatic
-  # errno of the last syscall (thread-local on glibc).
+  # errno of the last syscall (thread-local; bionic names it __errno).
   def self.errno : Errno
-    Errno.new(LibC.__errno_location.value)
+    {% if flag?(:android) %}
+      Errno.new(LibC.__errno.value)
+    {% else %}
+      Errno.new(LibC.__errno_location.value)
+    {% end %}
   end
 
   def self.eagain? : Bool
