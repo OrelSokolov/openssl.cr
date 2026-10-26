@@ -1,0 +1,17 @@
+name: openssl-shim
+version: 0.1.0
+description: |
+  Blocking HTTPS GET through the OpenSSL C API, for raw threads without a
+  Crystal scheduler (on Android every Crystal socket call from a sokol/egui
+  worker thread dies with NilAssertionError "Thread#scheduler cannot be
+  nil"). Desktop loads the shim via dlopen at runtime — no link-time
+  dependency; Android links ext/https_shim.c statically into the app.
+
+authors:
+  - oleg
+
+license: MIT
+crystal: ">= 1.10.0"
+
+scripts:
+  postinstall: bash ext/build.sh

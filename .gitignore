@@ -1,0 +1,5 @@
+/ext/libhttps_shim.so
+/ext/test_https_shim
+/spec/tmp/
+/lib/
+/shard.lock
